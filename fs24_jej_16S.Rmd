@@ -1,0 +1,946 @@
+---
+title: "fs24_jej_16S.Rmd"
+output: html_document
+date: '2023-07-14'
+---
+
+```{r}
+library(tidyverse)
+library(dada2) # v1.26
+path <- "/90daydata/fsepru/canderson/fs24_jej/fastq_cat_runs"
+list.files(path)
+
+```
+
+
+```{r}
+# forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern=".R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern=".R2.fastq", full.names = TRUE))
+
+# extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+# inspect quality profiles of forward reads
+plotQualityProfile(fnFs[8:13])
+```
+
+```{r}
+# inspect quality profiles of reverse reads
+plotQualityProfile(fnRs[8:13])
+```
+
+```{r}
+# place filtered files in filtered subdirectory
+filtFs <- file.path("/project/fsepru/hannah.watkins/fs24_jej_16S/filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path("/project/fsepru/hannah.watkins/fs24_jej_16S/filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,160),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE)
+saveRDS(out, file = "/project/fsepru/hannah.watkins/fs24_jej_16S/out.rds")
+out
+out <- readRDS(file = "/project/fsepru/hannah.watkins/fs24_jej_16S/out.rds")
+```
+
+```{r}
+# learn the error rates of forward reads
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+```{r}
+# learn the error rates of reverse reads
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+```{r}
+# visualize estimated error rates
+plotErrors(errF, nominalQ=TRUE)
+```
+```{r}
+# when filtering on a sample removes all the reads, there is no filtered file created - but, that filename is still in your filtFs and filtRs even though it doesn't exist, which is causing an error (you can fix this by subsetting your filtFs and filtRs to those where the files exist)
+
+filtFs <- filtFs[file.exists(filtFs)]
+filtRs <- filtRs[file.exists(filtRs)]
+
+# sample inference forward and reverse reads
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE, pool=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE, pool=TRUE)
+saveRDS(dadaFs, file = "/project/fsepru/hannah.watkins/fs24_jej_16S/dadaFs.rds")
+saveRDS(dadaRs, file = "/project/fsepru/hannah.watkins/fs24_jej_16S/dadaRs.rds")
+dadaFs <- readRDS(file = "/project/fsepru/hannah.watkins/fs24_jej_16S/dadaFs.rds")
+dadaRs <- readRDS(file = "/project/fsepru/hannah.watkins/fs24_jej_16S/dadaFs.rds")
+```
+
+```{r}
+# merge paired reads (submitted as a job; /project/fsepru/hannah.watkins/prevotella/dada2.R)
+mergers <- readRDS("/project/fsepru/hannah.watkins/fs24_jej_16S/mergers_pool.rds")
+```
+
+```{r}
+# construct a sequence table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+```{r}
+# inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+```{r}
+# remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+```
+
+```{r}
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+```{r}
+# track reads through the pipeline
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+saveRDS(track, file = "track.rds")
+track
+```
+
+
+```{r}
+library(dada2); packageVersion("dada2") # 1.20.0
+library(DECIPHER); packageVersion("DECIPHER") # 2.18.1
+
+# SILVA taxonomy
+# seqtab.nochim <- readRDS("seqtab.nochim.rds")
+
+dna <- DNAStringSet(getSequences(seqtab.nochim)) # Create a DNAStringSet from the ASVs
+load("/Users/christopher.anderso2/Downloads/SILVA_SSU_r138_2019.RData") 
+ids <- IdTaxa(dna, trainingSet, strand="top", processors=NULL, verbose=FALSE) # use all processors
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+# Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+taxid <- t(sapply(ids, function(x) {
+        m <- match(ranks, x$rank)
+        taxa <- x$taxon[m]
+        taxa[startsWith(taxa, "unclassified_")] <- NA
+        taxa
+}))
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(seqtab.nochim)
+
+
+
+```
+
+
+```{r}
+# tax table:
+# creating table of taxonomy and setting any that are unclassified as "NA"
+
+# giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+asv_tax <- t(sapply(ids, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(asv_tax) <- ranks
+rownames(asv_tax) <- gsub(pattern=">", replacement="", x=asv_headers)
+
+
+
+```
+
+```{r}
+asv_tax %>% 
+  as_tibble(rownames = "ASV") %>% 
+  count(domain)
+
+```
+
+
+```{r}
+# remove ASVs not Bacteria or Mito - dont need these for any samples, even controls
+asv_tax_keep <- asv_tax %>% 
+  as_tibble(rownames = "ASV") %>% 
+  filter(domain == "Bacteria") %>% 
+  filter(!genus %in% c("Mitochondria_genus_incertae_sedis"))
+
+asv_tax_keep %>% 
+  count(domain)
+
+asv_tax_keep
+
+```
+
+```{r}
+write.table(asv_tax_keep, "ASV_taxonomy_silva.tsv", sep = "\t", quote=F, col.names=NA)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(tidyverse)
+
+df_tax <- read_tsv("ASV_taxonomy_silva.tsv") 
+df_tax
+
+df_tax %>% 
+  count(domain)
+
+```
+
+
+
+```{r}
+library(tidyverse)
+
+track <- as_tibble(readRDS("track.rds"), rownames = "sample")
+
+track %>% 
+  arrange(nonchim)
+
+# samples to remove
+# JS108.R1.fastq.gz
+# JS109.R1.fastq.gz
+# JS112.R1.fastq.gz
+
+
+```
+
+```{r}
+df <- read_tsv("ASVs_counts.tsv") %>% 
+  #rename("ASV" = 1) %>% 
+  pivot_longer(names_to = "samples", values_to = "counts", cols = -ASV) %>% 
+  separate(samples, into = c("samples", NA, NA, NA), sep = "\\.", remove = T) %>% 
+  filter(! samples %in% c("JS108", "JS109", "JS112")) %>% 
+  filter(ASV %in% df_tax$ASV) %>% 
+  pivot_wider(id_cols = ASV, names_from = samples, values_from = counts)
+
+df
+
+
+df %>% 
+  write_tsv("ASVs_counts_filtered.tsv")
+
+```
+
+```{r}
+track2 <- df %>% 
+  select(-ASV) %>% 
+  summarise_all(sum) %>% 
+  pivot_longer(cols = everything(), names_to = "samples", values_to = "reads") %>% 
+  arrange(reads)
+
+track2
+
+track2 %>% 
+  write_tsv("track_filtered.tsv")
+
+```
+
+```{r, engine="bash"}
+# atlas
+# 2023.5 version of qiime2
+ micromamba activate /project/fsepru/canderson/micromamba_envs/envs/qiime2
+
+biom convert -i ASVs_counts_filtered.tsv -o ASVs_counts_filtered.biom --table-type="OTU table" --to-hdf5
+
+qiime tools import \
+  --input-path ASVs_counts_filtered.biom \
+  --type 'FeatureTable[Frequency]' \
+  --input-format BIOMV210Format \
+  --output-path ASV_counts.qza
+  
+  
+# https://www.nature.com/articles/s41587-020-0660-7
+# robust aitchinson pca
+
+qiime gemelli auto-rpca \
+    --i-table ASV_counts.qza \
+    --p-min-feature-count 10 \
+    --p-min-sample-count 500 \
+    --o-biplot ordination.qza \
+    --o-distance-matrix distance.qza  
+
+
+
+qiime emperor biplot \
+    --i-biplot ordination.qza \
+    --m-sample-metadata-file js_metadata.tsv \
+    --o-visualization ordination.qzv \
+    --p-number-of-features 8
+
+qiime tools export \
+  --input-path ordination.qza \
+  --output-path ordination_export
+
+qiime tools export \
+  --input-path distance.qza \
+  --output-path distance_export
+
+
+
+```
+
+```{r}
+library(tidyverse)
+library(qiime2R)
+
+obj <- read_qza("ordination.qza")
+obj$data$ProportionExplained
+
+# PC1 PC2 PC3
+
+```
+
+
+```{r}
+
+df_meta <- read_tsv("js_metadata.tsv") %>% 
+  dplyr::rename(SampleID = sample)
+
+
+df_pca <- obj$data$Vectors %>%
+  left_join(df_meta, by = "SampleID") %>% 
+  mutate(necropsy_date = as_factor(necropsy_date)) %>% 
+  mutate(necropsy_date = fct_relevel(necropsy_date, "Aug_20", "Aug_23", "Aug_27", "Aug_30", "Sep_3", "Sep_10", "Sep_17", "Sep_24")) %>% 
+  mutate(dpw = fct_relevel(dpw, "0 dpw", "3 dpw", "7 dpw", "10 dpw", "14 dpw", "21 dpw", "28 dpw", "35 dpw"))
+
+
+df_pca
+
+```
+
+
+```{r}
+
+cbPalette <- c("#0E96FF", "#FE7E79")
+
+p11 <- df_pca %>% 
+  filter(dpw != "10 dpw") %>% 
+  filter(dpw != "35 dpw") %>% 
+  filter(dpw != "28 dpw") %>% 
+  ggplot(aes(x = PC1, y = PC2, color = weaning_group)) +
+  geom_point(size = 1.25) +
+  xlab("PC1") +
+  ylab("PC2") +
+  facet_wrap(~dpw, nrow = 1) +
+  theme_classic(10) +
+  theme(
+    axis.text = element_text(color = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(color="black", fill=NA, size = 1),
+    axis.line = element_blank(),
+    legend.position = "none",
+      ) +
+  scale_x_continuous(breaks = c(-0.15, 0.0, 0.15)) +
+  scale_y_continuous(breaks = c(-0.2, 0.0, 0.2)) +
+  labs(color = "Weaning Group") +
+  #scale_colour_discrete(breaks=c("Standard", "Late"))
+  scale_color_manual(breaks=c("Standard", "Late"), values=cbPalette)
+
+p11 
+
+```
+
+```{r}
+
+p22 <- df_pca %>% 
+  filter(age_group != "d56") %>% 
+  filter(age_group != "d49") %>% 
+  filter(age_group != "d21") %>% 
+  filter(age_group != "d24") %>% 
+  mutate(age_group = str_replace(age_group, "d28", "d28*")) %>% 
+  mutate(age_group = str_replace(age_group, "d31", "d31*")) %>% 
+  mutate(age_group = str_replace(age_group, "d35", "d35*")) %>% 
+  ggplot(aes(x = PC1, y = PC2, color = weaning_group)) +
+  geom_point(size = 1.25) +
+  xlab("PC1") +
+  ylab("PC2") +
+  facet_wrap(~age_group, nrow = 1) +
+  theme_classic(10) +
+  theme(
+    axis.text = element_text(color = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    panel.border = element_rect(color="black", fill=NA, size = 1),
+    axis.line = element_blank(),
+    legend.position="bottom",
+    legend.margin=margin(t=-10),
+    legend.spacing.x = unit(0.05, 'cm')
+      ) +
+  scale_x_continuous(breaks = c(-0.125, 0.0, 0.125)) +
+  scale_y_continuous(breaks = c(-0.15, 0.0, 0.15)) +
+  labs(color = "Weaning Group") +
+   #scale_colour_discrete(breaks=c("Standard", "Late"))
+  scale_color_manual(breaks=c("Standard", "Late"), values=cbPalette)
+
+p22
+
+
+
+```
+
+```{r}
+library(patchwork)
+
+p1 / p2 + plot_annotation(tag_levels = 'a') 
+# + plot_layout(guides = 'collect')
+
+ggsave("figure_4.pdf", h = 5, w = 8)
+
+```
+
+
+
+
+```{r}
+p3 <- df_pca %>% 
+  filter(weaning_group == "Standard") %>% 
+  filter(dpw %in% c("0 dpw", "3 dpw", "7 dpw", "14 dpw", "21 dpw")) %>% 
+  ggplot(aes(x = PC1, y = PC2, color = dpw)) +
+  geom_point(size=1) +
+  xlab("PC1") +
+  ylab("PC2") +
+  theme_classic() +
+    theme(
+    axis.text = element_text(color = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    #panel.border = element_rect(color="black", fill=NA, size = 1),
+    #axis.line = element_blank(),
+    legend.position="none",
+    legend.margin=margin(t=-10),
+    legend.spacing.x = unit(0.05, 'cm'), 
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 13)
+      ) +
+  labs(color = "Weaning Group") +
+  scale_colour_discrete() +
+  scale_x_continuous(limits = c(-0.2, 0.2), breaks = c(-0.2, -0.1, 0.0, 0.1, 0.2)) +
+  scale_y_continuous(limits = c(-0.3, 0.3), breaks = c(-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3)) +
+  ggtitle("Standard Weaning")
+
+
+
+p4 <- df_pca %>% 
+  filter(weaning_group == "Late") %>% 
+  filter(dpw %in% c("0 dpw", "3 dpw", "7 dpw", "14 dpw", "21 dpw")) %>% 
+  ggplot(aes(x = PC1, y = PC2, color = dpw)) +
+  geom_point(size=1) +
+  xlab("PC1") +
+  ylab("PC2") +
+  theme_classic() +
+    theme(
+    axis.text = element_text(color = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    #panel.border = element_rect(color="black", fill=NA, size = 1),
+    #axis.line = element_blank(),
+    legend.position="bottom",
+    legend.margin=margin(t=-10),
+    legend.spacing.x = unit(0.05, 'cm'), 
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 13)
+      ) +
+  labs(color = "Weaning Group") +
+  scale_colour_discrete() +
+  scale_x_continuous(limits = c(-0.2, 0.2), breaks = c(-0.2, -0.1, 0.0, 0.1, 0.2)) +
+  scale_y_continuous(limits = c(-0.3, 0.3), breaks = c(-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3)) +
+  ggtitle("Late Weaning")
+
+p3
+p4
+
+```
+
+
+```{r}
+library(patchwork)
+
+p3 / p4 + plot_annotation(tag_levels = 'a') 
+# + plot_layout(guides = 'collect')
+
+ggsave("figure_s2.pdf", h = 5.5, w = 5.5)
+ggsave("figure_s2.png", h = 5.5, w = 5.5, dpi=500)
+ggsave("figure_s2.jpg", h = 5.5, w = 5.5, dpi=500)
+
+
+
+```
+
+
+```{r}
+library(tidyverse)
+library(vegan)
+
+metadata <- read_tsv("js_metadata.tsv") %>% 
+  mutate(farrow_pen = as.factor(farrow_pen))
+
+metadata1 <- read_tsv("js_metadata.tsv") %>% 
+  mutate(farrow_pen = as.factor(farrow_pen)) %>% 
+  select(sample, dpw)
+
+metadata2 <- read_tsv("js_metadata.tsv") %>% 
+  mutate(farrow_pen = as.factor(farrow_pen)) %>% 
+  select(sample, dpw) %>% 
+  rename(sample2 = sample) %>% 
+  rename(dpw2 = dpw)
+
+
+dis_meta <- read_tsv("distance-matrix.tsv") %>%
+  dplyr::rename(sample = 1) %>% 
+  left_join(metadata1, by = "sample") %>% 
+  pivot_longer(c(-sample, -dpw), names_to = "sample2", values_to = "distances") %>%
+  left_join(metadata2, by = "sample2") %>% 
+  filter(dpw %in% c("0 dpw", "3 dpw", "7 dpw", "10 dpw",  "14 dpw", "21 dpw")) %>% 
+  filter(dpw2 %in% c("0 dpw", "3 dpw", "7 dpw", "10 dpw", "14 dpw", "21 dpw")) %>% 
+  pivot_wider(id_cols = "sample", values_from = "distances", names_from = "sample2") %>% 
+  left_join(metadata, by = "sample") %>% 
+  dplyr::rename(sample = 1)
+
+all_dist <- dis_meta %>% 
+  select(all_of(.[["sample"]])) %>% 
+  as.dist()
+
+set.seed(1987)
+
+adonis2(all_dist ~ weaning_group  + age_group + sex + farrow_pen, data = dis_meta, by="terms", permutations = 10000)
+adonis2(all_dist ~ weaning_group  * age_group + sex + farrow_pen, data = dis_meta, by="terms", permutations = 10000)
+
+set.seed(1987)
+perm <- how(nperm = 10000)
+setBlocks(perm) <- with(dis_meta, weaning_group)
+adonis2(all_dist ~ necropsy_date + age_group + sex + farrow_pen, data = dis_meta, permutations = perm)
+
+set.seed(1987)
+perm <- how(nperm = 10000)
+setBlocks(perm) <- with(dis_meta, necropsy_date)
+adonis2(all_dist ~ weaning_group + sex + farrow_pen, data = dis_meta, permutations = perm)
+
+
+
+```
+
+
+
+
+```{r}
+library(pairwiseAdonis)
+library(tidyverse)
+
+metadata <- metadata <- read_tsv("js_metadata.tsv") %>% 
+  mutate(farrow_pen = as.factor(farrow_pen)) %>% 
+  unite(col = necropsy_date_group, sep = "-", c("dpw", "weaning_group"))
+
+metadata1 <- read_tsv("js_metadata.tsv") %>% 
+  mutate(farrow_pen = as.factor(farrow_pen)) %>% 
+  select(sample, dpw)
+
+metadata2 <- read_tsv("js_metadata.tsv") %>% 
+  mutate(farrow_pen = as.factor(farrow_pen)) %>% 
+  select(sample, dpw) %>% 
+  rename(sample2 = sample) %>% 
+  rename(dpw2 = dpw)
+
+
+dis_meta <- read_tsv("distance-matrix.tsv") %>%
+  dplyr::rename(sample = 1) %>% 
+  left_join(metadata1, by = "sample") %>% 
+  pivot_longer(c(-sample, -dpw), names_to = "sample2", values_to = "distances") %>%
+  left_join(metadata2, by = "sample2") %>% 
+  filter(dpw %in% c("0 dpw", "3 dpw", "7 dpw", "10 dpw",  "14 dpw", "21 dpw")) %>% 
+  filter(dpw2 %in% c("0 dpw", "3 dpw", "7 dpw", "10 dpw", "14 dpw", "21 dpw")) %>% 
+  pivot_wider(id_cols = "sample", values_from = "distances", names_from = "sample2") %>% 
+  left_join(metadata, by = "sample") %>% 
+  dplyr::rename(sample = 1)
+
+all_dist <- dis_meta %>% 
+  select(all_of(.[["sample"]])) %>% 
+  as.dist()
+
+
+
+set.seed(42)
+df_pw <- pairwiseAdonis::pairwise.adonis(all_dist, dis_meta$necropsy_date_group, p.adjust.m = 'fdr', perm=10000) %>% 
+  separate(pairs, into = c ("comp1", "comp2"), sep = " vs ", remove = FALSE) %>% 
+  separate(comp1, into = c("necropsy_date", "weaning_group"), sep = "-", remove = FALSE) %>% 
+  separate(comp2, into = c("necropsy_date2", "weaning_group2"), sep = "-", remove = FALSE)
+
+df_pw
+
+
+```
+
+
+
+
+```{r}
+metadata <- metadata <- read_tsv("js_metadata.tsv") %>% 
+  select(-necropsy_date) %>% 
+  rename(necropsy_date = dpw)
+
+
+df_pw_meta <- df_pw %>% 
+  left_join(metadata, by = c("necropsy_date", "weaning_group")) %>% 
+  select(pairs, R2, p.value, p.adjusted, comp1, necropsy_date, weaning_group, age_group, comp2, necropsy_date2, weaning_group2) %>% 
+  dplyr::rename(necropsy_date1 = necropsy_date, weaning_group1 = weaning_group, age_group1 = age_group) %>% 
+  dplyr::rename(necropsy_date = necropsy_date2, weaning_group = weaning_group2) %>% 
+  left_join(metadata, by = c("necropsy_date", "weaning_group")) %>% 
+  dplyr::rename(necropsy_date2 = necropsy_date, weaning_group2 = weaning_group, age_group2 = age_group) %>% 
+  select(pairs, R2, p.value, p.adjusted, comp1, necropsy_date1, weaning_group1, age_group1, comp2, necropsy_date2, weaning_group2, age_group2) %>% 
+  distinct()
+
+df_pw_meta
+
+```
+
+
+
+```{r}
+
+df_pw_meta1 <- df_pw_meta %>% 
+  filter(necropsy_date1 == necropsy_date2) 
+
+df_pw_meta2 <- df_pw_meta %>% 
+  filter(weaning_group1 == "Standard" & weaning_group2 == "Standard")
+
+df_pw_meta3 <- df_pw_meta %>% 
+  filter(weaning_group1 == "Late" & weaning_group2 == "Late")
+
+df_pw_meta4 <- df_pw_meta %>% 
+  filter(age_group1 == age_group2)
+
+df_pw_meta_sub <- bind_rows(df_pw_meta1, df_pw_meta2, df_pw_meta3, df_pw_meta4) %>% 
+  mutate(p.adj_sub = p.adjust(p.value, method = "fdr"))
+
+df_pw_meta_sub
+
+```
+
+```{r}
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "0 dpw" & weaning_group1 == "Standard") | (necropsy_date2 == "0 dpw" & weaning_group2 == "Standard")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "3 dpw" & weaning_group1 == "Standard") | (necropsy_date2 == "3 dpw" & weaning_group2 == "Standard")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "7 dpw" & weaning_group1 == "Standard") | (necropsy_date2 == "7 dpw" & weaning_group2 == "Standard")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "14 dpw" & weaning_group1 == "Standard") | (necropsy_date2 == "14 dpw" & weaning_group2 == "Standard")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "21 dpw" & weaning_group1 == "Standard") | (necropsy_date2 == "21 dpw" & weaning_group2 == "Standard")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+
+
+```
+
+```{r}
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "0 dpw" & weaning_group1 == "Late") | (necropsy_date2 == "0 dpw" & weaning_group2 == "Late")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "3 dpw" & weaning_group1 == "Late") | (necropsy_date2 == "3 dpw" & weaning_group2 == "Late")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "7 dpw" & weaning_group1 == "Late") | (necropsy_date2 == "7 dpw" & weaning_group2 == "Late")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "14 dpw" & weaning_group1 == "Late") | (necropsy_date2 == "14 dpw" & weaning_group2 == "Late")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+df_pw_meta_sub %>% 
+  filter((necropsy_date1 == "21 dpw" & weaning_group1 == "Late") | (necropsy_date2 == "21 dpw" & weaning_group2 == "Late")) %>% 
+  filter(! necropsy_date1 == necropsy_date2) %>% 
+  select(pairs, p.adj_sub, necropsy_date1, weaning_group1, necropsy_date2, weaning_group2)
+
+
+
+```
+
+
+
+
+
+
+```{r}
+pw1 <- df_pw_meta_sub %>% 
+  filter((age_group1 == "d28" & weaning_group1 == "Standard") | (age_group2 == "d28" & weaning_group2 == "Standard")) %>% 
+  filter((age_group1 == "d28" & weaning_group1 == "Late") | (age_group2 == "d28" & weaning_group2 == "Late")) %>% 
+  select(pairs, R2, p.value, p.adj_sub, necropsy_date1, age_group1, weaning_group1, necropsy_date2, weaning_group2, age_group2)
+
+pw2 <- df_pw_meta_sub %>% 
+  filter((age_group1 == "d31" & weaning_group1 == "Standard") | (age_group2 == "d31" & weaning_group2 == "Standard")) %>% 
+  filter((age_group1 == "d31" & weaning_group1 == "Late") | (age_group2 == "d31" & weaning_group2 == "Late")) %>% 
+  select(pairs, R2, p.value, p.adj_sub, necropsy_date1, age_group1, weaning_group1, necropsy_date2, weaning_group2, age_group2)
+
+pw3 <- df_pw_meta_sub %>% 
+  filter((age_group1 == "d35" & weaning_group1 == "Standard") | (age_group2 == "d35" & weaning_group2 == "Standard")) %>% 
+  filter((age_group1 == "d35" & weaning_group1 == "Late") | (age_group2 == "d35" & weaning_group2 == "Late")) %>% 
+  select(pairs, R2, p.value, p.adj_sub, necropsy_date1, age_group1, weaning_group1, necropsy_date2, weaning_group2, age_group2)
+
+pw4 <- df_pw_meta_sub %>% 
+  filter((age_group1 == "d42" & weaning_group1 == "Standard") | (age_group2 == "d42" & weaning_group2 == "Standard")) %>% 
+  filter((age_group1 == "d42" & weaning_group1 == "Late") | (age_group2 == "d42" & weaning_group2 == "Late")) %>% 
+  select(pairs, R2, p.value, p.adj_sub, necropsy_date1, age_group1, weaning_group1, necropsy_date2, weaning_group2, age_group2)
+
+
+bind_rows(pw1, pw2, pw3, pw4)
+
+```
+
+
+
+
+
+```{r}
+
+metadata <- metadata <- read_tsv("js_metadata.tsv") %>% 
+  mutate(farrow_pen = as.factor(farrow_pen)) %>% 
+  unite(col = dpw_group, sep = "-", c("dpw", "weaning_group")) %>% 
+  select(sample, dpw_group, age_group)
+
+dis_long <- read_tsv("distance-matrix.tsv") %>%
+  dplyr::rename(sample1 = 1) %>% 
+  pivot_longer(names_to = "sample2", values_to = "dist", cols = -sample1)
+
+dis_long_meta <- dis_long %>% 
+  dplyr::rename(sample = sample1) %>% 
+  left_join(metadata, by = c("sample")) %>% 
+  dplyr::rename(sample1 = sample, dpw_group1 = dpw_group, age_group1 = age_group) %>% 
+  separate(dpw_group1, into = c("dpw1", "weaning_group1"), sep = "-", remove = FALSE) %>% 
+  dplyr::rename(sample = sample2) %>% 
+  left_join(metadata, by = c("sample")) %>%   
+  dplyr::rename(sample2 = sample, dpw_group2 = dpw_group, age_group2 = age_group) %>% 
+  separate(dpw_group2, into = c("dpw2", "weaning_group2"), sep = "-", remove = FALSE)
+
+dis_long_meta
+
+```
+
+
+
+
+
+
+```{r}
+
+dis_std <- dis_long_meta %>% 
+  filter(dpw_group1 == "0 dpw-Standard" ) %>% 
+  filter(weaning_group1 == "Standard" & weaning_group2 == "Standard") %>% 
+  filter(sample1 != sample2) %>% 
+  mutate(dpw1 = str_replace(dpw1, " dpw", "")) %>% 
+  unite(col = "dpw_comp", remove = F, sep=" vs ", c("dpw1", "dpw2"))
+
+dis_late <- dis_long_meta %>% 
+  filter(dpw_group1 == "0 dpw-Late" ) %>% 
+  filter(weaning_group1 == "Late" & weaning_group2 == "Late") %>% 
+  filter(sample1 != sample2) %>% 
+  mutate(dpw1 = str_replace(dpw1, " dpw", "")) %>% 
+  unite(col = "dpw_comp", remove = F, sep=" vs ", c("dpw1", "dpw2"))
+
+cbPalette <- c("#0E96FF", "#FE7E79")
+
+p5 <- bind_rows(dis_std, dis_late) %>% 
+  mutate(weaning_group1 = fct_relevel(weaning_group1, "Standard", "Late")) %>% 
+  mutate(dpw_comp = fct_relevel(dpw_comp, "0 vs 0 dpw", "0 vs 3 dpw", "0 vs 7 dpw", "0 vs 10 dpw", "0 vs 14 dpw", "0 vs 21 dpw", "0 vs 28 dpw", "0 vs 35 dpw" )) %>% 
+  filter(dpw_comp != "0 vs 10 dpw") %>% 
+  filter(dpw_comp != "0 vs 35 dpw") %>% 
+  filter(dpw_comp != "0 vs 28 dpw") %>% 
+  ggplot(aes(x = weaning_group1, y = dist, color = weaning_group1)) +
+  geom_boxplot() +
+  facet_wrap(~dpw_comp, nrow=1) +
+  theme_classic(10) +
+  xlab("") + ylab("Aitchison distance") +
+  labs(color = "Weaning Group") +
+  #scale_colour_discrete(limits=c("Late", "Standard"), breaks = c("Standard", "Late")) +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text = element_text(color = "black"),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.line = element_blank(),
+        legend.position="none",
+    ) +
+  scale_color_manual(breaks=c("Standard", "Late"), values=cbPalette)
+  
+p5
+
+
+```
+
+
+
+
+
+```{r}
+p1 <- dis_long_meta %>% 
+  filter((dpw_group1 == "0 dpw-Standard") & (dpw_group2 == "3 dpw-Standard"))
+
+p2 <- dis_long_meta %>% 
+  filter((dpw_group1 == "3 dpw-Standard") & (dpw_group2 == "7 dpw-Standard"))
+
+p3 <- dis_long_meta %>% 
+  filter((dpw_group1 == "7 dpw-Standard") & (dpw_group2 == "14 dpw-Standard"))
+
+p4 <- dis_long_meta %>% 
+  filter((dpw_group1 == "14 dpw-Standard") & (dpw_group2 == "21 dpw-Standard"))
+
+
+
+df_std <- bind_rows(p1, p2, p3, p4) %>% 
+  mutate(dpw1 = str_replace(dpw1, " dpw", "")) %>% 
+  unite(col = "dpw_comp", remove = F, sep=" vs ", c("dpw1", "dpw2")) 
+
+
+p1 <- dis_long_meta %>% 
+  filter((dpw_group1 == "0 dpw-Late") & (dpw_group2 == "3 dpw-Late"))
+
+p2 <- dis_long_meta %>% 
+  filter((dpw_group1 == "3 dpw-Late") & (dpw_group2 == "7 dpw-Late"))
+
+p3 <- dis_long_meta %>% 
+  filter((dpw_group1 == "7 dpw-Late") & (dpw_group2 == "14 dpw-Late"))
+
+p4 <- dis_long_meta %>% 
+  filter((dpw_group1 == "14 dpw-Late") & (dpw_group2 == "21 dpw-Late"))
+
+
+df_late <- bind_rows(p1, p2, p3, p4) %>% 
+  mutate(dpw1 = str_replace(dpw1, " dpw", "")) %>% 
+  unite(col = "dpw_comp", remove = F, sep=" vs ", c("dpw1", "dpw2")) 
+
+p6 <- bind_rows(df_std, df_late) %>% 
+  mutate(weaning_group1 = fct_relevel(weaning_group1, "Standard", "Late")) %>% 
+  mutate(dpw_comp = str_replace(dpw_comp, "3 vs 7 dpw", "3 vs 7 dpw (*)")) %>% 
+  mutate(dpw_comp = str_replace(dpw_comp, "7 vs 14 dpw", "7 vs 14 dpw (*)")) %>% 
+  mutate(dpw_comp = fct_relevel(dpw_comp, "0 vs 3 dpw", "3 vs 7 dpw (*)", "7 vs 14 dpw (*)", "14 vs 21 dpw")) %>% 
+  ggplot(aes(x = weaning_group1, y = dist, color = weaning_group1)) +
+  geom_boxplot() +
+  facet_wrap(~dpw_comp, nrow=1) +
+  theme_classic(10) +
+  xlab("") + ylab("Aitchison distance") +
+  labs(color = "Weaning Group") +
+  # scale_colour_discrete(limits=c("Late", "Standard"), breaks = c("Standard", "Late")) +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text = element_text(color = "black"),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.border = element_rect(color="black", fill=NA, size = 1),
+        axis.line = element_blank(),
+        legend.position="bottom",
+        legend.margin=margin(t=-10),
+        legend.spacing.x = unit(0.05, 'cm')
+    ) +
+  scale_color_manual(breaks=c("Standard", "Late"), values=cbPalette)
+  
+
+p6
+
+```
+
+```{r}
+library(patchwork)
+
+p5 / p6 + plot_annotation(tag_levels = 'a') 
+# + plot_layout(guides = 'collect')
+
+ggsave("figure_5.pdf", h = 6, w = 6)
+
+
+```
+
+
+```{r}
+library(patchwork)
+
+p11 / p22 / p5 / p6 + plot_annotation(tag_levels = 'a')
+# + plot_layout(guides = 'collect')
+
+ggsave("figure_4.pdf", h = 8, w = 6.25)
+ggsave("figure_4.jpg", h = 8, w = 6.25, dpi=500)
+ggsave("figure_4.png", h = 8, w = 6.25, dpi=500)
+
+
+
+```
+
+
+
+```{r}
+p1 <- dis_long_meta %>% 
+  filter((dpw_group1 == "0 dpw-Standard") & (dpw_group2 == "3 dpw-Standard"))
+p2 <- dis_long_meta %>% 
+  filter((dpw_group1 == "0 dpw-Late") & (dpw_group2 == "3 dpw-Late"))
+wilcox.test(p1$dist, p2$dist)
+
+p1 <- dis_long_meta %>% 
+  filter((dpw_group1 == "3 dpw-Standard") & (dpw_group2 == "7 dpw-Standard"))
+p2 <- dis_long_meta %>% 
+  filter((dpw_group1 == "3 dpw-Late") & (dpw_group2 == "7 dpw-Late"))
+wilcox.test(p1$dist, p2$dist)
+
+p1 <- dis_long_meta %>% 
+  filter((dpw_group1 == "7 dpw-Standard") & (dpw_group2 == "14 dpw-Standard"))
+p2 <- dis_long_meta %>% 
+  filter((dpw_group1 == "7 dpw-Late") & (dpw_group2 == "14 dpw-Late"))
+wilcox.test(p1$dist, p2$dist)
+
+p1 <- dis_long_meta %>% 
+  filter((dpw_group1 == "14 dpw-Standard") & (dpw_group2 == "21 dpw-Standard"))
+p2 <- dis_long_meta %>% 
+  filter((dpw_group1 == "14 dpw-Late") & (dpw_group2 == "21 dpw-Late"))
+wilcox.test(p1$dist, p2$dist)
+
+
+```
+
+
+
+
